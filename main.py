@@ -5,34 +5,55 @@ from queue import Queue
 from threading import Thread
 import time
 
+from database import LogDatabase
+
 app = FastAPI(title="Log Processor")
 
-#for incoming logs
-log_queue = Queue()  # Incoming logs
-processed_logs = []  
+
+db = LogDatabase()
+
+
+log_queue = Queue()
+
+
+batch = []
+BATCH_SIZE = 100
+batch_lock = Thread()
 
 def process_worker():
-    #process logs from queuees
-    print("starting worker")
+
+    local_batch = []
+    
     while True:
+        try:
 
-        log = log_queue.get()
-        
-        log["processed_at"] = datetime.now().isoformat()
-        log["word_count"] = len(log["message"].split())
-        
+            log = log_queue.get(timeout=1)
+            
 
-        processed_logs.append(log)
-        
-        print(f"Processed: [{log['level']}] {log['service']} - Total: {len(processed_logs)}")
-        
-        log_queue.task_done()
+            log["processed_at"] = datetime.now().isoformat()
+            log["word_count"] = len(log["message"].split())
+            
+
+            local_batch.append(log)
+            
+
+            if len(local_batch) >= BATCH_SIZE:
+                count = db.insert_logs_batch(local_batch)
+                local_batch = []
+            
+            log_queue.task_done()
+            
+        except Exception as e:
+            if local_batch:
+                count = db.insert_logs_batch(local_batch)
+                local_batch = []
+                print("inserted " , count, "logs from timeout")
+
 
 NUM_WORKERS = 4
 for i in range(NUM_WORKERS):
     worker = Thread(target=process_worker, daemon=True)
     worker.start()
-    print("worker " , i + 1 , " starting")
 
 @app.post("/logs")
 async def ingest_logs(level: str, message: str, service: str):
@@ -52,32 +73,25 @@ async def ingest_logs(level: str, message: str, service: str):
 
 @app.get("/stats")
 async def get_stats():
-    by_level = {}
-    by_service = {}
-    
-    for log in processed_logs:
-        level = log["level"]
-        service = log["service"]
-        by_level[level] = by_level.get(level, 0) + 1
-        by_service[service] = by_service.get(service, 0) + 1
-    
-    return {
-        "queued": log_queue.qsize(),
-        "processed": len(processed_logs),
-        "by_level": by_level,
-        "by_service": by_service
-    }
+    stats = db.get_stats()
+    stats["queued"] = log_queue.qsize()
+    return stats
 
 @app.get("/logs")
-async def get_logs(level: Optional[str] = None, limit: int = 50):
-    filtered = processed_logs
-    
-    if level:
-        filtered = [log for log in processed_logs if log["level"] == level.upper()]
-    
+async def get_logs(level: Optional[str] = None, limit: int = 100):
+    logs = db.get_logs(level=level, limit=limit)
     return {
-        "count": len(filtered),
-        "logs": filtered[-limit:][::-1]  
+        "count": len(logs),
+        "logs": logs
+    }
+
+@app.get("/search")
+async def search_logs(q: str, limit: int = 100):
+    logs = db.search_logs(search_term=q, limit=limit)
+    return {
+        "count": len(logs),
+        "query": q,
+        "logs": logs
     }
 
 if __name__ == "__main__":
